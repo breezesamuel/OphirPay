@@ -12,11 +12,6 @@ import { isSubscribedToEvent } from "@/lib/webhook-filter";
 
 /**
  * Dispatch a webhook event to subscribed endpoints.
- *
- * @param scopedUserId When provided, only webhooks owned by this user are
- *   notified — prevents cross-user webhook leakage (user A's payment must
- *   never fire user B's webhook and leak A's data to B's endpoint).
- *   Events are persisted for replay when a user scope is present.
  */
 export async function dispatchWebhookEvent(
   event: WebhookEventType,
@@ -59,33 +54,24 @@ export async function dispatchWebhookEvent(
     // Fire all webhook deliveries in parallel (non-blocking)
     const results = await Promise.allSettled(
       webhooks.map(async (wh) => {
-        const result = await deliverWebhook(wh.url, wh.secret, payload);
+        const result = await deliverWebhook(wh.url, wh.secret, payload, 3, wh.id);
         if (storedEventId) {
           await recordWebhookDelivery(wh.id, storedEventId, result.success ? "SUCCESS" : "FAILED", {
             responseCode: result.statusCode,
-            isReplay: false,
+            latencyMs: result.latencyMs,
+            attempts: result.attempts,
+            errorMessage: result.errorMessage,
           });
         }
-        return result.success;
-      }),
+      })
     );
 
-    const succeeded = results.filter((r) => r.status === "fulfilled" && r.value).length;
-    const failed = results.length - succeeded;
-
-    if (failed > 0) {
-      logger.warn("Some webhook deliveries failed", { event, succeeded, failed });
-    }
+    results.forEach((r, i) => {
+      if (r.status === "rejected") {
+        logger.error("Webhook dispatch error", { webhookId: webhooks[i].id, error: r.reason });
+      }
+    });
   } catch (err) {
-    logger.error("Webhook dispatch error", { event, error: String(err) });
+    logger.error("dispatchWebhookEvent failed", { error: err instanceof Error ? err.message : String(err) });
   }
-}
-
-export function dispatchWebhookEventAsync(
-  event: WebhookEventType,
-  data: Record<string, unknown>,
-  scopedUserId?: string,
-): void {
-  if (typeof window !== "undefined") return;
-  void dispatchWebhookEvent(event, data, scopedUserId);
 }
