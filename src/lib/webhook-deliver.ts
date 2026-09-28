@@ -9,12 +9,12 @@ import {
   isTimeoutError,
 } from "@/lib/timeout";
 import crypto from "crypto";
+import prisma from "@/lib/prisma";
 
 export interface WebhookPayload {
   event: string;
   timestamp: string;
   data: Record<string, unknown>;
-  /** Present and true only for integrator test events — never real payments. */
   test?: boolean;
 }
 
@@ -41,7 +41,7 @@ export function canonicalizeWebhookBody(payload: WebhookPayload): string {
 }
 
 export const BLOCKED_WEBHOOK_TARGET_ERROR =
-  "Webhook target rejected by the SSRF guard — URL resolves to a private/internal address or a disallowed port";
+  "Webhook target rejected by the SSRF guard - URL resolves to a private/internal address or a disallowed port";
 
 export function signWebhookPayload(payload: WebhookPayload, secret: string): string {
   const canonical = canonicalizeWebhookBody(payload);
@@ -103,7 +103,8 @@ export async function deliverWebhook(
   url: string,
   secret: string,
   payload: WebhookPayload,
-  maxRetries = 3
+  maxRetries = 3,
+  webhookId?: string
 ): Promise<WebhookDeliveryDetails> {
   const startedAt = Date.now();
   const request = buildWebhookRequestPreview(payload, secret);
@@ -115,7 +116,7 @@ export async function deliverWebhook(
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     if (!(await isSafeWebhookUrlAtDelivery(url))) {
       logger.error(
-        "Webhook delivery blocked — URL resolved to a private/internal address or a disallowed port",
+        "Webhook delivery blocked - URL resolved to a private/internal address or a disallowed port",
         { url, attempt }
       );
       incMetric("webhooks_failed_total");
@@ -138,8 +139,6 @@ export async function deliverWebhook(
 
     attempts = attempt;
     try {
-      // Explicit, configurable timeout + AbortSignal (issue #747): a hung
-      // endpoint aborts here instead of blocking the request budget.
       const response = await fetchWithTimeout(
         url,
         {
@@ -192,6 +191,29 @@ export async function deliverWebhook(
   logger.error("Webhook delivery exhausted retries", { url, event: payload.event });
   incMetric("webhooks_failed_total");
   const latencyMs = Date.now() - startedAt;
+
+  // Persist to dead-letter queue when retries exhausted
+  try {
+    await prisma.webhookDeadLetter.create({
+      data: {
+        webhookId: "unknown", // caller should update this
+        eventId: null,
+        targetUrl: url,
+        eventType: payload.event,
+        payload: JSON.stringify({ ...payload, signature: "" }),
+        errorMessage: lastError ?? "Delivery exhausted retries",
+        attempts: maxRetries,
+        lastStatusCode: lastStatusCode,
+        lastError: lastError,
+        requestHeaders: JSON.stringify(request.headers),
+        requestBody: request.body,
+        responseBody: lastResponseBody,
+      },
+    });
+  } catch (dlErr) {
+    logger.error("Failed to write dead-letter entry", { error: dlErr instanceof Error ? dlErr.message : String(dlErr) });
+  }
+
   return {
     success: false,
     statusCode: lastStatusCode,
