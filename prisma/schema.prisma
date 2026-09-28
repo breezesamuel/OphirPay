@@ -558,6 +558,29 @@ model WebhookDelivery {
   @@index([replayBatchId])
 }
 
+model WebhookDeadLetter {
+  id            String   @id @default(cuid())
+  webhookId     String
+  eventId       String?
+  targetUrl     String
+  eventType     String
+  payload       String   // JSON payload that failed
+  errorMessage  String?
+  attempts      Int      @default(0)
+  lastStatusCode Int?
+  lastError     String?
+  requestHeaders String? // JSON
+  requestBody   String?
+  responseBody  String?
+  createdAt     DateTime @default(now())
+  resolvedAt    DateTime?
+  resolvedBy    String?  // user who resolved it
+  resolution    String?  // "redelivered" | "discarded" | "ignored"
+
+  @@index([webhookId, createdAt])
+  @@index([resolvedAt])
+}
+
 enum DeliveryStatus {
   SUCCESS
   FAILED
